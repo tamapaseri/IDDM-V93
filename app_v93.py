@@ -1,7 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 """
 IDDM V83（3モデル統合）× V93安定化ロジック 3クラス分類 Streamlitアプリ
-（Streamlit Community Cloud 対応・複数枚静止画推論）
+（Streamlit Community Cloud 対応・複数枚静止画推論・スマホ向けリセットボタン付き）
 """
 
 from pathlib import Path
@@ -321,6 +321,11 @@ def init_session():
         st.session_state.recent_history = []
 
 
+def reset_stabilization_history():
+    st.session_state.last_stable_id = None
+    st.session_state.recent_history = []
+
+
 def render_summary(results: list):
     st.markdown("---")
     st.subheader("📋 一括判定サマリー（V83 3モデル統合・3クラス）")
@@ -409,13 +414,25 @@ def main():
         "V93の安定化ロジック（信頼度差 `< 0.25` で直前維持 ＋ 直近5件多数決）で複数枚の静止画を判定します[cite: 8]。"
     )
 
+    # メイン画面上部のコントロール（iPhoneで操作しやすい位置）
+    ctrl_col1, ctrl_col2 = st.columns([2, 1])
+    with ctrl_col1:
+        use_stabilization = st.checkbox("V93 状態安定化を適用", value=True, key="main_use_stab")
+    with ctrl_col2:
+        if st.button("🔄 安定化履歴をリセット", use_container_width=True, key="main_reset_btn"):
+            reset_stabilization_history()
+            st.rerun()
+
+    st.caption(
+        f"現在の履歴: `{st.session_state.recent_history}` / "
+        f"直前確定ID: `{st.session_state.last_stable_id}`"
+    )
+
     with st.sidebar:
         st.header("推論・表示オプション")
-        use_stabilization = st.checkbox("V93 状態安定化を適用", value=True)
         show_processed = st.checkbox("ROIズーム＋CLAHE前処理画像も表示", value=False)
-        if st.button("安定化履歴をリセット"):
-            st.session_state.last_stable_id = None
-            st.session_state.recent_history = []
+        if st.button("🔄 安定化履歴をリセット", use_container_width=True, key="side_reset_btn"):
+            reset_stabilization_history()
             st.rerun()
 
         st.markdown("---")
