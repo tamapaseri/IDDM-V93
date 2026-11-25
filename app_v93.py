@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-IDDM V83（3モデル統合）× V93ロジック 3クラス分類 Streamlitアプリ
+IDDM V93 単一3クラスモデル × 安定化ロジック Streamlitアプリ
 （iPhone / Streamlit Community Cloud 対応・predict_images_v93.py 準拠）
 """
 
@@ -14,38 +14,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# パス・定数設定（predict_images_v93.py / train_fast_v83.py 準拠）
+# パス・定数設定（predict_images_v93.py 準拠）
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 
-MODEL_SPECS = [
-    {
-        "key": "norm",
-        "class_id": 0,
-        "label": "正常範囲 (Normal: 70-179 mg/dL)",
-        "candidates": [
-            BASE_DIR / "results_v83_class" / "model_v83_norm.pth",
-            BASE_DIR / "model_v83_norm.pth",
-        ],
-    },
-    {
-        "key": "hyper",
-        "class_id": 1,
-        "label": "高血糖 (Hyperglycemia: >=180 mg/dL)",
-        "candidates": [
-            BASE_DIR / "results_v83_class" / "model_v83_hyper.pth",
-            BASE_DIR / "model_v83_hyper.pth",
-        ],
-    },
-    {
-        "key": "hypo",
-        "class_id": 2,
-        "label": "低血糖 (Hypoglycemia: <70 mg/dL)",
-        "candidates": [
-            BASE_DIR / "results_v83_class" / "model_v83_hypo.pth",
-            BASE_DIR / "model_v83_hypo.pth",
-        ],
-    },
+MODEL_CANDIDATES = [
+    BASE_DIR / "results_v86_class" / "mobilenetv3_v86_classification_best.pth",
+    BASE_DIR / "mobilenetv3_v86_classification_best.pth",
 ]
 
 IMAGE_SIZE = 224
@@ -61,6 +36,12 @@ HISTORY_WINDOW_SIZE = 5
 HIGH_CONF_OVERRIDE_THRESHOLD = 0.70
 HIGH_CONF_MARGIN_THRESHOLD = 0.40
 HIGH_CONF_INJECT_COUNT = 3
+
+CLASS_LABEL_MAP = {
+    0: "正常範囲 (Normal: 70-179 mg/dL)",
+    1: "高血糖 (Hyperglycemia: >=180 mg/dL)",
+    2: "低血糖 (Hypoglycemia: <70 mg/dL)",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +63,9 @@ def load_face_cascade():
 FACE_CASCADE = load_face_cascade()
 
 
-class BinaryClassifier(nn.Module):
+class Unified3ClassModel(nn.Module):
+    """単一3クラス分類モデル（正常:0 / 高血糖:1 / 低血糖:2）"""
+
     def __init__(self, feat_dim: int):
         super().__init__()
         self.backbone = timm.create_model(MODEL_NAME, pretrained=False, num_classes=0)
@@ -90,69 +73,57 @@ class BinaryClassifier(nn.Module):
             nn.Linear(feat_dim, 128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(128, 2),
+            nn.Linear(128, 3),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.backbone(x))
 
 
-def resolve_candidate_path(candidates: list[Path]) -> Path:
-    for p in candidates:
-        if p.exists():
-            return p
-    return candidates[0]
+def resolve_model_path() -> Path:
+    for candidate in MODEL_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return MODEL_CANDIDATES[0]
 
 
 @st.cache_resource
-def load_v83_models():
+def load_3class_model(model_path_str: str):
+    target_path = Path(model_path_str)
     temp_backbone = timm.create_model(MODEL_NAME, pretrained=False, num_classes=0)
     with torch.no_grad():
         feat_dim = temp_backbone(torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)).shape[1]
 
-    models = {}
-    resolved_paths = {}
-    errors = []
+    model = Unified3ClassModel(feat_dim).to(DEVICE)
 
-    for spec in MODEL_SPECS:
-        key = spec["key"]
-        target_path = resolve_candidate_path(spec["candidates"])
-        resolved_paths[key] = target_path
+    if not target_path.exists():
+        searched = "\n".join(f"- {p.relative_to(BASE_DIR)}" for p in MODEL_CANDIDATES)
+        return (
+            model,
+            False,
+            f"モデルファイルが見つかりません。以下のいずれかに配置してください:\n{searched}",
+        )
 
-        model = BinaryClassifier(feat_dim).to(DEVICE)
-        if not target_path.exists():
-            cand_str = ", ".join(str(p.relative_to(BASE_DIR)) for p in spec["candidates"])
-            errors.append(f"[{key}] モデルが見つかりません（候補: {cand_str}）")
-            models[key] = None
-            continue
-
-        try:
-            checkpoint = torch.load(target_path, map_location=DEVICE)
-            state_dict = (
-                checkpoint["state_dict"]
-                if isinstance(checkpoint, dict) and "state_dict" in checkpoint
-                else checkpoint
-            )
-            model.load_state_dict(state_dict, strict=False)
-            model.eval()
-            models[key] = model
-        except Exception as e:
-            errors.append(f"[{key}] 読み込み失敗 ({target_path.name}): {e}")
-            models[key] = None
-
-    all_loaded = all(models[s["key"]] is not None for s in MODEL_SPECS)
-    return models, resolved_paths, all_loaded, errors
+    try:
+        checkpoint = torch.load(target_path, map_location=DEVICE)
+        state_dict = (
+            checkpoint["state_dict"]
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+            else checkpoint
+        )
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        return model, True, None
+    except Exception as e:
+        return model, False, f"モデル読み込みエラー: {e}"
 
 
 def get_3class_label_text(class_id: int) -> str:
-    for spec in MODEL_SPECS:
-        if spec["class_id"] == class_id:
-            return spec["label"]
-    return "不明"
+    return CLASS_LABEL_MAP.get(class_id, "不明")
 
 
 # ---------------------------------------------------------------------------
-# 前処理・3モデル統合・V93安定化
+# 前処理・3クラス推論・V93安定化
 # ---------------------------------------------------------------------------
 def robust_lighting_normalization(img_bgr: np.ndarray) -> np.ndarray:
     try:
@@ -213,51 +184,19 @@ def to_model_tensor(processed_bgr: np.ndarray) -> torch.Tensor:
     return tensor.unsqueeze(0).to(DEVICE)
 
 
-def predict_3class_from_v83(
-    models: dict,
-    tensor: torch.Tensor,
+def calibrate_3class_probs(
+    logits: torch.Tensor,
     temperature: float = DEFAULT_TEMPERATURE,
     normal_boost: float = DEFAULT_NORMAL_BOOST,
-):
-    """
-    V83の3モデル（norm / hyper / hypo）から陽性確率(probs[1])を抽出し、
-    温度スケーリングと正常クラス補正倍率を適用して3クラス確率に正規化する。
-    """
-    raw_pos_probs = []
-    cal_pos_probs = []
-
-    for spec in MODEL_SPECS:
-        m = models[spec["key"]]
-        if m is None:
-            raw_pos_probs.append(0.0)
-            cal_pos_probs.append(0.0)
-            continue
-
-        logits = m(tensor)
-        raw_bin = F.softmax(logits, dim=1)[0].cpu().numpy()
-        cal_bin = F.softmax(logits / max(temperature, 1e-6), dim=1)[0].cpu().numpy()
-
-        raw_pos_probs.append(float(raw_bin[1]))
-        cal_pos_probs.append(float(cal_bin[1]))
-
-    raw_vec = np.array(raw_pos_probs, dtype=np.float64)
-    raw_sum = float(raw_vec.sum())
-    raw_probs = (
-        (raw_vec / raw_sum).astype(np.float32)
-        if raw_sum > 1e-8
-        else np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
-    )
-
-    cal_vec = np.array(cal_pos_probs, dtype=np.float64)
-    cal_vec[0] *= normal_boost
-    cal_sum = float(cal_vec.sum())
-    cal_probs = (
-        (cal_vec / cal_sum).astype(np.float32)
-        if cal_sum > 1e-8
-        else np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=np.float32)
-    )
-
-    return raw_probs, cal_probs, raw_pos_probs
+) -> np.ndarray:
+    """温度スケーリングと正常クラス（ID 0）のバイアス補正を適用して再正規化"""
+    scaled_logits = logits / max(temperature, 1e-6)
+    probs = F.softmax(scaled_logits, dim=1)[0].cpu().numpy().astype(np.float64)
+    probs[0] *= normal_boost
+    total = float(probs.sum())
+    if total > 1e-8:
+        probs /= total
+    return probs.astype(np.float32)
 
 
 def stabilize_v93(
@@ -297,7 +236,7 @@ def stabilize_v93(
 
 
 def run_inference_on_bytes(
-    models: dict,
+    model: nn.Module,
     file_bytes: bytes,
     use_stabilization: bool,
     temperature: float,
@@ -316,9 +255,11 @@ def run_inference_on_bytes(
 
     processed_bgr, mode_str = process_image_v57(img_bgr)
     tensor = to_model_tensor(processed_bgr)
-    raw_probs, probs, raw_pos_probs = predict_3class_from_v83(
-        models=models,
-        tensor=tensor,
+
+    outputs = model(tensor)
+    raw_probs = F.softmax(outputs, dim=1)[0].cpu().numpy()
+    probs = calibrate_3class_probs(
+        logits=outputs,
         temperature=temperature,
         normal_boost=normal_boost,
     )
@@ -348,7 +289,6 @@ def run_inference_on_bytes(
             "mode_str": mode_str,
             "excluded": excluded,
             "raw_probs": raw_probs,
-            "raw_pos_probs": raw_pos_probs,
             "probs": probs,
             "raw_id": raw_id,
             "final_id": final_id,
@@ -445,11 +385,9 @@ def render_details(results: list, show_processed: bool):
 
             excl_text = " (履歴除外)" if r.get("excluded") else ""
             rp = r["raw_probs"]
-            rpos = r["raw_pos_probs"]
             st.caption(
                 f"検出モード: {r['mode_str']}{excl_text} | "
                 f"補正前: [正常 {rp[0]:.2f}, 高血糖 {rp[1]:.2f}, 低血糖 {rp[2]:.2f}] | "
-                f"各2値陽性確率: [norm {rpos[0]:.2f}, hyper {rpos[1]:.2f}, hypo {rpos[2]:.2f}] | "
                 f"履歴: {r['history_after']}"
             )
 
@@ -461,7 +399,7 @@ def render_details(results: list, show_processed: bool):
 
 def main():
     st.set_page_config(
-        page_title="IDDM V83×V93 3クラス血糖値状態判定",
+        page_title="IDDM V93 3クラス血糖値状態判定",
         page_icon="🩺",
         layout="centered",
     )
@@ -471,11 +409,12 @@ def main():
         st.toast("安定化履歴をリセットしました")
         st.session_state.reset_notice = False
 
-    models, resolved_paths, all_loaded, errors = load_v83_models()
+    model_path = resolve_model_path()
+    model, loaded, err_msg = load_3class_model(str(model_path))
 
     st.title("🩺 IDDM 3クラス血糖値状態判定")
     st.markdown(
-        "V83 3モデル（`norm` / `hyper` / `hypo`）統合＋V93安定化ロジック"
+        "単一3クラスモデル（`Unified3ClassModel`）× V93安定化ロジック"
         "（`Temp=1.35`, `NormalBoost=1.45`、高確信度追従、`Fallback_Zoomed`履歴除外、直近5件多数決）。"
     )
 
@@ -490,7 +429,6 @@ def main():
     fresh_batch_each_time = st.checkbox(
         "アップロードごとに履歴を自動リセットして評価する（PCのバッチ実行と同じ挙動）",
         value=True,
-        help="オンにすると、同じ画像群や新しい画像群をアップロードした際に履歴を最初から開始します。",
     )
 
     with st.expander("⚙️ キャリブレーション調整（V93既定値: Temp=1.35 / NormalBoost=1.45）", expanded=False):
@@ -526,12 +464,10 @@ def main():
             st.rerun()
 
         st.markdown("---")
-        st.caption("V83 モデル配置パス:")
-        for key, p in resolved_paths.items():
-            st.caption(f"- `{key}`: `{p.relative_to(BASE_DIR)}`")
+        st.caption(f"使用モデルパス: `{model_path.relative_to(BASE_DIR)}`")
 
-    if not all_loaded:
-        st.error("一部のV83モデルを読み込めませんでした:\n" + "\n".join(errors))
+    if not loaded:
+        st.error(err_msg)
 
     uploaded_files = st.file_uploader(
         "静止画を選択（複数選択可: JPG / JPEG / PNG / BMP / WEBP）",
@@ -540,11 +476,13 @@ def main():
     )
 
     if uploaded_files:
-        # iPhoneのファイルピッカーでは選択順や並び順がPCと異なる場合があるため、ファイル名順で揃えるか確認できるようにする
-        sort_by_name = st.checkbox("ファイル名順に並べ替えて推論する（PCの昇順推論と揃える）", value=True)
-        ordered_files = sorted(uploaded_files, key=lambda f: f.name.lower()) if sort_by_name else list(uploaded_files)
+        sort_by_name = st.checkbox("ファイル名順に並べ替えて推論する", value=True)
+        ordered_files = (
+            sorted(uploaded_files, key=lambda f: f.name.lower())
+            if sort_by_name
+            else list(uploaded_files)
+        )
 
-        # アップロードされたファイル群の識別キーが変わった場合、またはバッチ毎リセットが有効な場合は履歴を初期化
         batch_signature = tuple((f.name, f.size) for f in ordered_files)
         if fresh_batch_each_time and st.session_state.get("last_batch_signature") != batch_signature:
             cur_last_id = None
@@ -556,11 +494,11 @@ def main():
         st.info(f"選択枚数: {len(ordered_files)} 枚")
         results = []
 
-        with st.spinner("V83 3モデルで推論中..."):
+        with st.spinner("3クラスモデルで推論中..."):
             with torch.inference_mode():
                 for idx, up_file in enumerate(ordered_files, 1):
                     res, cur_last_id, cur_history = run_inference_on_bytes(
-                        models=models,
+                        model=model,
                         file_bytes=up_file.read(),
                         use_stabilization=use_stabilization,
                         temperature=temperature,
