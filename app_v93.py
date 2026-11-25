@@ -1,12 +1,14 @@
 ﻿# -*- coding: utf-8 -*-
 """
 IDDM V93 3クラス分類 Streamlitアプリ
-（predict_images_v93.py と同一の推論・安定化出力に準拠）
+（EXIF回転補正対応・predict_images_v93.py と同一の推論・安定化出力に準拠）
 """
 
+import io
 from pathlib import Path
 import cv2
 import numpy as np
+from PIL import Image, ImageOps
 import streamlit as st
 import timm
 import torch
@@ -120,8 +122,27 @@ def get_3class_label_text(class_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 前処理・3クラス推論・安定化（predict_images_v93.py 準拠）
+# EXIF回転補正・前処理・3クラス推論・安定化
 # ---------------------------------------------------------------------------
+def decode_image_with_exif(file_bytes: bytes):
+    """
+    EXIF Orientation に従って画像を正立させた BGR numpy配列を返す。
+    PILで開けない形式の場合は cv2.imdecode にフォールバックする。
+    """
+    exif_applied = False
+    try:
+        with Image.open(io.BytesIO(file_bytes)) as pil_img:
+            orig_size = pil_img.size
+            transposed = ImageOps.exif_transpose(pil_img)
+            if transposed.size != orig_size or transposed is not pil_img:
+                exif_applied = True
+            rgb = np.array(transposed.convert("RGB"))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), exif_applied
+    except Exception:
+        arr = np.asarray(bytearray(file_bytes), dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR), False
+
+
 def robust_lighting_normalization(img_bgr: np.ndarray) -> np.ndarray:
     try:
         ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
@@ -229,8 +250,7 @@ def run_inference_on_bytes(
     last_stable_id,
     recent_history: list,
 ):
-    arr = np.asarray(bytearray(file_bytes), dtype=np.uint8)
-    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    img_bgr, exif_applied = decode_image_with_exif(file_bytes)
     if img_bgr is None:
         return (
             {"error": "画像のデコードに失敗しました。"},
@@ -269,6 +289,7 @@ def run_inference_on_bytes(
             "display_rgb": cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
             "processed_rgb": cv2.cvtColor(processed_bgr, cv2.COLOR_BGR2RGB),
             "mode_str": mode_str,
+            "exif_applied": exif_applied,
             "probs": probs,
             "raw_id": raw_id,
             "final_id": final_id,
@@ -317,6 +338,7 @@ def render_summary(results: list):
             })
         else:
             p = r["probs"]
+            mode_disp = f"{r['mode_str']} (EXIF補正)" if r.get("exif_applied") else r["mode_str"]
             rows.append({
                 "No.": r["idx"],
                 "ファイル名": r["name"],
@@ -325,7 +347,7 @@ def render_summary(results: list):
                 "正常 (0)": f"{p[0]:.2f}",
                 "高血糖 (1)": f"{p[1]:.2f}",
                 "低血糖 (2)": f"{p[2]:.2f}",
-                "検出モード": r["mode_str"],
+                "検出モード": mode_disp,
             })
 
     st.table(rows)
@@ -343,7 +365,7 @@ def render_details(results: list, show_processed: bool):
 
             if show_processed:
                 c1, c2 = st.columns(2)
-                c1.image(r["display_rgb"], caption="元画像", use_container_width=True)
+                c1.image(r["display_rgb"], caption="元画像（EXIF補正後）", use_container_width=True)
                 c2.image(
                     r["processed_rgb"],
                     caption=f"前処理後 ({r['mode_str']})",
@@ -361,8 +383,9 @@ def render_details(results: list, show_processed: bool):
                 st.error(f"**{label_text}**（Conf: {r['final_conf']:.2f}）")
 
             p = r["probs"]
+            exif_note = " / EXIF回転補正: 適用" if r.get("exif_applied") else ""
             st.caption(
-                f"検出モード: {r['mode_str']} | "
+                f"検出モード: {r['mode_str']}{exif_note} | "
                 f"確率分布: [正常: {p[0]:.2f}, 高血糖: {p[1]:.2f}, 低血糖: {p[2]:.2f}] | "
                 f"安定化判定: ID {r['final_id']} (Conf: {r['final_conf']:.2f}) | 履歴: {r['history_after']}"
             )
@@ -384,7 +407,7 @@ def main():
     model, loaded, err_msg = load_3class_model(str(model_path))
 
     st.title("🩺 IDDM 3クラス血糖値状態判定")
-    st.markdown("`predict_images_v93.py` と同一の単一3クラスモデル・安定化ロジックで静止画を判定します。")
+    st.markdown("`predict_images_v93.py` と同一の単一3クラスモデル・安定化ロジックにEXIF回転補正を適用しています。")
 
     ctrl_col1, ctrl_col2 = st.columns([2, 1])
     with ctrl_col1:
