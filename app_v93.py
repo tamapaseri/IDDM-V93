@@ -1,7 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 """
-IDDM V93 単一3クラスモデル × 安定化ロジック Streamlitアプリ
-（iPhone / Streamlit Community Cloud 対応・predict_images_v93.py 準拠）
+IDDM V93 3クラス分類 Streamlitアプリ
+（predict_images_v93.py と同一の推論・安定化出力に準拠）
 """
 
 from pathlib import Path
@@ -27,15 +27,12 @@ IMAGE_SIZE = 224
 MODEL_NAME = "mobilenetv3_small_100"
 DEVICE = torch.device("cpu")
 
-# V93 準拠の補正・安定化パラメータ
-DEFAULT_TEMPERATURE = 1.35
-DEFAULT_NORMAL_BOOST = 1.45
+# predict_images_v93.py 準拠のパラメータ
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_NORMAL_BOOST = 1.0
 
 CONFIDENCE_MARGIN_THRESHOLD = 0.25
 HISTORY_WINDOW_SIZE = 5
-HIGH_CONF_OVERRIDE_THRESHOLD = 0.70
-HIGH_CONF_MARGIN_THRESHOLD = 0.40
-HIGH_CONF_INJECT_COUNT = 3
 
 CLASS_LABEL_MAP = {
     0: "正常範囲 (Normal: 70-179 mg/dL)",
@@ -123,7 +120,7 @@ def get_3class_label_text(class_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 前処理・3クラス推論・V93安定化
+# 前処理・3クラス推論・安定化（predict_images_v93.py 準拠）
 # ---------------------------------------------------------------------------
 def robust_lighting_normalization(img_bgr: np.ndarray) -> np.ndarray:
     try:
@@ -184,44 +181,32 @@ def to_model_tensor(processed_bgr: np.ndarray) -> torch.Tensor:
     return tensor.unsqueeze(0).to(DEVICE)
 
 
-def calibrate_3class_probs(
+def compute_probs(
     logits: torch.Tensor,
     temperature: float = DEFAULT_TEMPERATURE,
     normal_boost: float = DEFAULT_NORMAL_BOOST,
 ) -> np.ndarray:
-    """温度スケーリングと正常クラス（ID 0）のバイアス補正を適用して再正規化"""
     scaled_logits = logits / max(temperature, 1e-6)
     probs = F.softmax(scaled_logits, dim=1)[0].cpu().numpy().astype(np.float64)
-    probs[0] *= normal_boost
-    total = float(probs.sum())
-    if total > 1e-8:
-        probs /= total
+    if normal_boost != 1.0:
+        probs[0] *= normal_boost
+        total = float(probs.sum())
+        if total > 1e-8:
+            probs /= total
     return probs.astype(np.float32)
 
 
-def stabilize_v93(
+def stabilize_v93_original(
     raw_id: int,
     probs: np.ndarray,
-    mode_str: str,
     last_stable_id,
     recent_history: list,
 ):
-    sorted_probs = np.sort(probs)
-    raw_conf = float(sorted_probs[-1])
-    conf_margin = float(sorted_probs[-1] - sorted_probs[-2])
-
-    # Fallback_Zoomed は履歴から除外
-    if mode_str == "Fallback_Zoomed":
-        display_id = last_stable_id if last_stable_id is not None else raw_id
-        return display_id, float(probs[display_id]), last_stable_id, list(recent_history), True
-
-    # 高確信度での追従（履歴クリア＆複数回注入）
-    if raw_conf >= HIGH_CONF_OVERRIDE_THRESHOLD and conf_margin >= HIGH_CONF_MARGIN_THRESHOLD:
-        updated_history = [raw_id] * min(HIGH_CONF_INJECT_COUNT, HISTORY_WINDOW_SIZE)
-        return raw_id, float(probs[raw_id]), raw_id, updated_history, False
-
+    """predict_images_v93.py と同じ安定化ロジック"""
     stable_id = raw_id
     if last_stable_id is not None and raw_id != last_stable_id:
+        sorted_probs = np.sort(probs)
+        conf_margin = float(sorted_probs[-1] - sorted_probs[-2])
         if conf_margin < CONFIDENCE_MARGIN_THRESHOLD:
             stable_id = last_stable_id
 
@@ -232,7 +217,7 @@ def stabilize_v93(
 
     final_id = int(np.bincount(updated_history).argmax())
     final_conf = float(probs[final_id])
-    return final_id, final_conf, final_id, updated_history, False
+    return final_id, final_conf, final_id, updated_history
 
 
 def run_inference_on_bytes(
@@ -257,8 +242,7 @@ def run_inference_on_bytes(
     tensor = to_model_tensor(processed_bgr)
 
     outputs = model(tensor)
-    raw_probs = F.softmax(outputs, dim=1)[0].cpu().numpy()
-    probs = calibrate_3class_probs(
+    probs = compute_probs(
         logits=outputs,
         temperature=temperature,
         normal_boost=normal_boost,
@@ -267,13 +251,11 @@ def run_inference_on_bytes(
 
     next_last_id = last_stable_id
     next_history = recent_history
-    excluded = False
 
     if use_stabilization:
-        final_id, final_conf, next_last_id, next_history, excluded = stabilize_v93(
+        final_id, final_conf, next_last_id, next_history = stabilize_v93_original(
             raw_id=raw_id,
             probs=probs,
-            mode_str=mode_str,
             last_stable_id=last_stable_id,
             recent_history=recent_history,
         )
@@ -287,8 +269,6 @@ def run_inference_on_bytes(
             "display_rgb": cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
             "processed_rgb": cv2.cvtColor(processed_bgr, cv2.COLOR_BGR2RGB),
             "mode_str": mode_str,
-            "excluded": excluded,
-            "raw_probs": raw_probs,
             "probs": probs,
             "raw_id": raw_id,
             "final_id": final_id,
@@ -320,7 +300,7 @@ def reset_stabilization_history():
 
 def render_summary(results: list):
     st.markdown("---")
-    st.subheader("📋 一括判定サマリー（補正後 3クラス）")
+    st.subheader("📋 一括判定サマリー（3クラス）")
 
     rows = []
     for r in results:
@@ -333,12 +313,10 @@ def render_summary(results: list):
                 "正常 (0)": "-",
                 "高血糖 (1)": "-",
                 "低血糖 (2)": "-",
-                "ROIモード": "-",
-                "履歴": "-",
+                "検出モード": "-",
             })
         else:
             p = r["probs"]
-            mode_disp = f"{r['mode_str']} (除外)" if r.get("excluded") else r["mode_str"]
             rows.append({
                 "No.": r["idx"],
                 "ファイル名": r["name"],
@@ -347,8 +325,7 @@ def render_summary(results: list):
                 "正常 (0)": f"{p[0]:.2f}",
                 "高血糖 (1)": f"{p[1]:.2f}",
                 "低血糖 (2)": f"{p[2]:.2f}",
-                "ROIモード": mode_disp,
-                "履歴": str(r["history_after"]),
+                "検出モード": r["mode_str"],
             })
 
     st.table(rows)
@@ -383,18 +360,12 @@ def render_details(results: list, show_processed: bool):
             else:
                 st.error(f"**{label_text}**（Conf: {r['final_conf']:.2f}）")
 
-            excl_text = " (履歴除外)" if r.get("excluded") else ""
-            rp = r["raw_probs"]
+            p = r["probs"]
             st.caption(
-                f"検出モード: {r['mode_str']}{excl_text} | "
-                f"補正前: [正常 {rp[0]:.2f}, 高血糖 {rp[1]:.2f}, 低血糖 {rp[2]:.2f}] | "
-                f"履歴: {r['history_after']}"
+                f"検出モード: {r['mode_str']} | "
+                f"確率分布: [正常: {p[0]:.2f}, 高血糖: {p[1]:.2f}, 低血糖: {p[2]:.2f}] | "
+                f"安定化判定: ID {r['final_id']} (Conf: {r['final_conf']:.2f}) | 履歴: {r['history_after']}"
             )
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("正常範囲 (0)", f"{r['probs'][0]*100:.1f}%")
-            m2.metric("高血糖 (1)", f"{r['probs'][1]*100:.1f}%")
-            m3.metric("低血糖 (2)", f"{r['probs'][2]*100:.1f}%")
 
 
 def main():
@@ -413,10 +384,7 @@ def main():
     model, loaded, err_msg = load_3class_model(str(model_path))
 
     st.title("🩺 IDDM 3クラス血糖値状態判定")
-    st.markdown(
-        "単一3クラスモデル（`Unified3ClassModel`）× V93安定化ロジック"
-        "（`Temp=1.35`, `NormalBoost=1.45`、高確信度追従、`Fallback_Zoomed`履歴除外、直近5件多数決）。"
-    )
+    st.markdown("`predict_images_v93.py` と同一の単一3クラスモデル・安定化ロジックで静止画を判定します。")
 
     ctrl_col1, ctrl_col2 = st.columns([2, 1])
     with ctrl_col1:
@@ -427,11 +395,11 @@ def main():
             st.rerun()
 
     fresh_batch_each_time = st.checkbox(
-        "アップロードごとに履歴を自動リセットして評価する（PCのバッチ実行と同じ挙動）",
+        "アップロードごとに履歴を自動リセットして評価する",
         value=True,
     )
 
-    with st.expander("⚙️ キャリブレーション調整（V93既定値: Temp=1.35 / NormalBoost=1.45）", expanded=False):
+    with st.expander("⚙️ 詳細補正パラメータ（既定値: Temp=1.00 / NormalBoost=1.00）", expanded=False):
         cal_c1, cal_c2 = st.columns(2)
         with cal_c1:
             temperature = st.slider(
@@ -452,8 +420,7 @@ def main():
 
     st.caption(
         f"現在の履歴: `{st.session_state.recent_history}` / "
-        f"直前確定ID: `{st.session_state.last_stable_id}` / "
-        f"Temp: `{temperature:.2f}`, NormalBoost: `{normal_boost:.2f}`"
+        f"直前確定ID: `{st.session_state.last_stable_id}`"
     )
 
     with st.sidebar:
@@ -494,7 +461,7 @@ def main():
         st.info(f"選択枚数: {len(ordered_files)} 枚")
         results = []
 
-        with st.spinner("3クラスモデルで推論中..."):
+        with st.spinner("推論を実行中..."):
             with torch.inference_mode():
                 for idx, up_file in enumerate(ordered_files, 1):
                     res, cur_last_id, cur_history = run_inference_on_bytes(
