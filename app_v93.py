@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-IDDM 血糖値3クラス分類 Streamlit アプリ（顔検出感度改善・背景完全マスク・Boost補正版）
+IDDM 血糖値3クラス分類 Streamlit アプリ（近接顔検出強化・背景完全マスク・Boost補正版）
 """
 
 import io
@@ -39,7 +39,7 @@ CLASS_NAMES = {
 
 
 # ---------------------------------------------------------------------------
-# 顔検出ラッパー（アスペクト比維持 YuNet + 感度緩和 Haar）
+# 顔検出ラッパー（YuNet + 近接アップ対応 Haar）
 # ---------------------------------------------------------------------------
 class FaceDetectorWrapper:
     def __init__(self, yunet_path: Path | None = None):
@@ -52,7 +52,7 @@ class FaceDetectorWrapper:
                     model=str(yunet_path),
                     config="",
                     input_size=(320, 320),
-                    score_threshold=0.45,
+                    score_threshold=0.35,
                     nms_threshold=0.3,
                     top_k=50,
                 )
@@ -79,7 +79,7 @@ class FaceDetectorWrapper:
         if h < 16 or w < 16:
             return False, None
 
-        # 1. FaceDetectorYN (YuNet) - 縦横比を保って 320x320 にパディング
+        # 1. FaceDetectorYN (YuNet) - アスペクト比維持パディング
         if self.yunet is not None:
             try:
                 det_size = 320
@@ -114,7 +114,7 @@ class FaceDetectorWrapper:
             except Exception:
                 pass
 
-        # 2. Haar Cascade フォールバック（感度をやや緩和）
+        # 2. Haar Cascade フォールバック（超近接アップにも対応するよう2段階で探索）
         if self.haar is not None:
             try:
                 max_side = 640
@@ -131,12 +131,23 @@ class FaceDetectorWrapper:
 
                 dh, dw = det_bgr.shape[:2]
                 gray = cv2.cvtColor(det_bgr, cv2.COLOR_BGR2GRAY)
+
+                # 第1パス: 標準感度
                 faces = self.haar.detectMultiScale(
                     gray,
                     scaleFactor=1.08,
                     minNeighbors=3,
                     minSize=(max(16, int(dw * 0.08)), max(16, int(dh * 0.08))),
                 )
+                # 第2パス: 近接アップ・陰影差がある場合の緩和探索
+                if len(faces) == 0:
+                    faces = self.haar.detectMultiScale(
+                        gray,
+                        scaleFactor=1.05,
+                        minNeighbors=2,
+                        minSize=(max(16, int(dw * 0.10)), max(16, int(dh * 0.10))),
+                    )
+
                 if len(faces) > 0:
                     x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
                     if scale != 1.0:
@@ -194,7 +205,7 @@ def mask_out_background_keep_color(
 
     mask = np.zeros((h, w), dtype=np.float32)
     center = (w // 2, int(h * 0.46))
-    axes = (max(4, int(w * 0.42)), max(4, int(h * 0.46)))
+    axes = (max(4, int(w * 0.44)), max(4, int(h * 0.48)))
     cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
 
     blur_k = max(5, (min(w, h) // 24) | 1)
@@ -212,10 +223,6 @@ def preprocess_face_only_keep_color(
     enable_mask: bool = True,
     allow_fallback: bool = False,
 ) -> tuple[bool, np.ndarray, str]:
-    """
-    顔が検出できた場合のみ縦長切り出し＋背景マスク（色味保持）を行い (True, roi_bgr, mode) を返す。
-    allow_fallback=False の場合、顔未検出時は (False, img_bgr, "Face_Not_Detected") を返す。
-    """
     h, w = img_bgr.shape[:2]
     found, bbox = detector.detect_largest_face(img_bgr)
     if found and bbox is not None:
@@ -241,9 +248,10 @@ def preprocess_face_only_keep_color(
     if not allow_fallback:
         return False, img_bgr, "Face_Not_Detected"
 
-    cx, cy = w / 2.0, h * 0.44
-    box_h = int(h * 0.72)
-    box_w = int(min(w * 0.78, box_h * 0.75))
+    # 近接アップ顔画像に合う中央縦長枠フォールバック
+    cx, cy = w / 2.0, h * 0.48
+    box_h = int(h * 0.80)
+    box_w = int(min(w * 0.84, box_h * 0.78))
     x1 = max(0, int(cx - box_w / 2.0))
     y1 = max(0, int(cy - box_h / 2.0))
     x2 = min(w, x1 + box_w)
