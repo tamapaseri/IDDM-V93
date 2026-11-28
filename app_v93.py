@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-IDDM 血糖値3クラス分類 Streamlit アプリ（背景完全マスク・顔未検出スキップ・Boost補正版）
+IDDM 血糖値3クラス分類 Streamlit アプリ（顔検出感度改善・背景完全マスク・Boost補正版）
 """
 
 import io
@@ -39,7 +39,7 @@ CLASS_NAMES = {
 
 
 # ---------------------------------------------------------------------------
-# 顔検出ラッパー（FaceDetectorYN + Haar フォールバック）
+# 顔検出ラッパー（アスペクト比維持 YuNet + 感度緩和 Haar）
 # ---------------------------------------------------------------------------
 class FaceDetectorWrapper:
     def __init__(self, yunet_path: Path | None = None):
@@ -52,7 +52,7 @@ class FaceDetectorWrapper:
                     model=str(yunet_path),
                     config="",
                     input_size=(320, 320),
-                    score_threshold=0.6,
+                    score_threshold=0.45,
                     nms_threshold=0.3,
                     top_k=50,
                 )
@@ -79,42 +79,51 @@ class FaceDetectorWrapper:
         if h < 16 or w < 16:
             return False, None
 
+        # 1. FaceDetectorYN (YuNet) - 縦横比を保って 320x320 にパディング
         if self.yunet is not None:
             try:
-                det_w, det_h = 320, 320
-                resized = cv2.resize(img_bgr, (det_w, det_h), interpolation=cv2.INTER_AREA)
-                self.yunet.setInputSize((det_w, det_h))
-                _, faces = self.yunet.detect(resized)
+                det_size = 320
+                scale = det_size / float(max(h, w))
+                nw = max(1, int(round(w * scale)))
+                nh = max(1, int(round(h * scale)))
+                resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
+                canvas = np.full((det_size, det_size, 3), 114, dtype=np.uint8)
+                pad_x = (det_size - nw) // 2
+                pad_y = (det_size - nh) // 2
+                canvas[pad_y : pad_y + nh, pad_x : pad_x + nw] = resized
+
+                self.yunet.setInputSize((det_size, det_size))
+                _, faces = self.yunet.detect(canvas)
                 if faces is not None and len(faces) > 0:
                     best = max(
                         faces, key=lambda f: max(0.0, float(f[2])) * max(0.0, float(f[3]))
                     )
-                    fx, fy, fw, fh = (
-                        float(best[0]),
-                        float(best[1]),
-                        float(best[2]),
-                        float(best[3]),
-                    )
-                    if fw > 5.0 and fh > 5.0:
-                        sx = w / float(det_w)
-                        sy = h / float(det_h)
-                        x1 = max(0, int(fx * sx))
-                        y1 = max(0, int(fy * sy))
-                        bw = max(1, int(fw * sx))
-                        bh = max(1, int(fh * sy))
-                        return True, (x1, y1, bw, bh)
+                    fx = (float(best[0]) - pad_x) / scale
+                    fy = (float(best[1]) - pad_y) / scale
+                    fw = float(best[2]) / scale
+                    fh = float(best[3]) / scale
+
+                    if fw > 4.0 and fh > 4.0:
+                        x1 = max(0, int(round(fx)))
+                        y1 = max(0, int(round(fy)))
+                        x2 = min(w, int(round(fx + fw)))
+                        y2 = min(h, int(round(fy + fh)))
+                        if x2 > x1 and y2 > y1:
+                            return True, (x1, y1, x2 - x1, y2 - y1)
             except Exception:
                 pass
 
+        # 2. Haar Cascade フォールバック（感度をやや緩和）
         if self.haar is not None:
             try:
-                max_side = 512
+                max_side = 640
                 scale = 1.0
                 if max(h, w) > max_side:
                     scale = max_side / float(max(h, w))
                     det_bgr = cv2.resize(
                         img_bgr,
-                        (int(w * scale), int(h * scale)),
+                        (max(1, int(w * scale)), max(1, int(h * scale))),
                         interpolation=cv2.INTER_AREA,
                     )
                 else:
@@ -124,9 +133,9 @@ class FaceDetectorWrapper:
                 gray = cv2.cvtColor(det_bgr, cv2.COLOR_BGR2GRAY)
                 faces = self.haar.detectMultiScale(
                     gray,
-                    scaleFactor=1.12,
-                    minNeighbors=4,
-                    minSize=(max(16, int(dw * 0.14)), max(16, int(dh * 0.14))),
+                    scaleFactor=1.08,
+                    minNeighbors=3,
+                    minSize=(max(16, int(dw * 0.08)), max(16, int(dh * 0.08))),
                 )
                 if len(faces) > 0:
                     x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
@@ -135,7 +144,7 @@ class FaceDetectorWrapper:
                         y = int(y / scale)
                         fw = int(fw / scale)
                         fh = int(fh / scale)
-                    if fw >= w * 0.12 and fh >= h * 0.12:
+                    if fw >= w * 0.08 and fh >= h * 0.08:
                         return True, (int(x), int(y), int(fw), int(fh))
             except Exception:
                 pass
@@ -201,34 +210,49 @@ def preprocess_face_only_keep_color(
     img_bgr: np.ndarray,
     detector: FaceDetectorWrapper,
     enable_mask: bool = True,
+    allow_fallback: bool = False,
 ) -> tuple[bool, np.ndarray, str]:
     """
     顔が検出できた場合のみ縦長切り出し＋背景マスク（色味保持）を行い (True, roi_bgr, mode) を返す。
-    顔未検出時はフォールバックせず (False, img_bgr, "Face_Not_Detected") を返す。
+    allow_fallback=False の場合、顔未検出時は (False, img_bgr, "Face_Not_Detected") を返す。
     """
     h, w = img_bgr.shape[:2]
     found, bbox = detector.detect_largest_face(img_bgr)
-    if not found or bbox is None:
+    if found and bbox is not None:
+        x, y, fw, fh = bbox
+        cx = x + fw / 2.0
+        cy = y + fh * 0.56
+
+        box_w = int(fw * 1.45)
+        box_h = int(fh * 1.95)
+
+        x1 = max(0, int(cx - box_w / 2.0))
+        y1 = max(0, int(cy - box_h / 2.0))
+        x2 = min(w, x1 + box_w)
+        y2 = min(h, y1 + box_h)
+
+        cropped = img_bgr[y1:y2, x1:x2]
+        if cropped.size > 0:
+            masked_bgr = mask_out_background_keep_color(
+                cropped, bg_gray=128, enable_mask=enable_mask
+            )
+            return True, masked_bgr, detector.mode_label
+
+    if not allow_fallback:
         return False, img_bgr, "Face_Not_Detected"
 
-    x, y, fw, fh = bbox
-    cx = x + fw / 2.0
-    cy = y + fh * 0.56
-
-    box_w = int(fw * 1.45)
-    box_h = int(fh * 1.95)
-
+    cx, cy = w / 2.0, h * 0.44
+    box_h = int(h * 0.72)
+    box_w = int(min(w * 0.78, box_h * 0.75))
     x1 = max(0, int(cx - box_w / 2.0))
     y1 = max(0, int(cy - box_h / 2.0))
     x2 = min(w, x1 + box_w)
     y2 = min(h, y1 + box_h)
-
     cropped = img_bgr[y1:y2, x1:x2]
     if cropped.size == 0:
-        return False, img_bgr, "Face_Not_Detected"
-
+        cropped = img_bgr
     masked_bgr = mask_out_background_keep_color(cropped, bg_gray=128, enable_mask=enable_mask)
-    return True, masked_bgr, detector.mode_label
+    return True, masked_bgr, "Fallback_Rect"
 
 
 @st.cache_resource
@@ -327,9 +351,11 @@ def main():
 
     with st.sidebar:
         st.header("推論・前処理設定")
-        st.caption(f"検出器: `{detector.mode_label}` / Device: `{device_str}`")
+        yunet_status = "ONNXあり" if detector.yunet is not None else "ONNXなし(Haar)"
+        st.caption(f"検出器: `{detector.mode_label}` ({yunet_status}) / Device: `{device_str}`")
 
         enable_mask = st.checkbox("外周背景をマスクアウト（色味保持）", value=True)
+        allow_fallback = st.checkbox("顔未検出時も中央枠で判定する（Fallback）", value=False)
         show_roi_preview = st.checkbox("前処理後の切り出し画像を表示", value=True)
 
         st.divider()
@@ -360,7 +386,7 @@ def main():
     )
 
     if not uploaded_files:
-        st.info("画像を1枚以上アップロードすると判定を実行します。顔が検出できない画像は安全のためスキップされます。")
+        st.info("画像を1枚以上アップロードすると判定を実行します。")
         return
 
     class_boosts = (boost_norm, boost_hyper, boost_hypo)
@@ -383,7 +409,10 @@ def main():
                 continue
 
             face_ok, processed_bgr, mode_str = preprocess_face_only_keep_color(
-                img_bgr, detector=detector, enable_mask=enable_mask
+                img_bgr,
+                detector=detector,
+                enable_mask=enable_mask,
+                allow_fallback=allow_fallback,
             )
             if not face_ok:
                 st.warning(f"検出モード: `{mode_str}` — 顔が検出できなかったため判定をスキップしました。")
@@ -407,10 +436,10 @@ def main():
             with col1:
                 if show_roi_preview:
                     roi_rgb = cv2.cvtColor(processed_bgr, cv2.COLOR_BGR2RGB)
-                    st.image(roi_rgb, caption=f"前処理ROI ({mode_str})", use_container_width=True)
+                    st.image(roi_rgb, caption=f"前処理ROI ({mode_str})", width="stretch")
                 else:
                     orig_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    st.image(orig_rgb, caption="元画像", use_container_width=True)
+                    st.image(orig_rgb, caption="元画像", width="stretch")
 
             with col2:
                 st.markdown(f"**判定結果**: `{CLASS_NAMES[final_id]}`（確度: `{final_conf:.2f}` / 履歴: `{recent_history}`）")
