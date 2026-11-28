@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-IDDM 血糖値3クラス分類 Streamlit アプリ（ROI枠引き締め・背景マスク密着・Boost補正版）
+IDDM 血糖値3クラス分類 Streamlit アプリ（顔輪郭フィット・背景マスク改善・Boost補正版）
 """
 
 import io
@@ -39,7 +39,7 @@ CLASS_NAMES = {
 
 
 # ---------------------------------------------------------------------------
-# 顔検出ラッパー（YuNet + 近接アップ対応 Haar）
+# 顔検出ラッパー（YuNet ランドマーク対応 + 近接アップ対応 Haar）
 # ---------------------------------------------------------------------------
 class FaceDetectorWrapper:
     def __init__(self, yunet_path: Path | None = None):
@@ -74,12 +74,16 @@ class FaceDetectorWrapper:
 
     def detect_largest_face(
         self, img_bgr: np.ndarray
-    ) -> tuple[bool, tuple[int, int, int, int] | None]:
+    ) -> tuple[bool, tuple[int, int, int, int] | None, dict | None]:
+        """
+        戻り値: (found, (x, y, w, h), landmarks_dict)
+        landmarks_dict は元画像座標系での eyes / nose / mouth を保持する。
+        """
         h, w = img_bgr.shape[:2]
         if h < 16 or w < 16:
-            return False, None
+            return False, None, None
 
-        # 1. FaceDetectorYN (YuNet) - アスペクト比維持パディング
+        # 1. FaceDetectorYN (YuNet) - アスペクト比維持パディング + ランドマーク復元
         if self.yunet is not None:
             try:
                 det_size = 320
@@ -109,8 +113,34 @@ class FaceDetectorWrapper:
                         y1 = max(0, int(round(fy)))
                         x2 = min(w, int(round(fx + fw)))
                         y2 = min(h, int(round(fy + fh)))
+
+                        lm = None
+                        if len(best) >= 14:
+                            def to_orig_pt(px_idx: int, py_idx: int):
+                                ox = (float(best[px_idx]) - pad_x) / scale
+                                oy = (float(best[py_idx]) - pad_y) / scale
+                                return (ox, oy)
+
+                            re_pt = to_orig_pt(4, 5)
+                            le_pt = to_orig_pt(6, 7)
+                            no_pt = to_orig_pt(8, 9)
+                            rm_pt = to_orig_pt(10, 11)
+                            lm_pt = to_orig_pt(12, 13)
+                            if all(
+                                np.isfinite(v)
+                                for pt in (re_pt, le_pt, no_pt, rm_pt, lm_pt)
+                                for v in pt
+                            ):
+                                lm = {
+                                    "right_eye": re_pt,
+                                    "left_eye": le_pt,
+                                    "nose": no_pt,
+                                    "right_mouth": rm_pt,
+                                    "left_mouth": lm_pt,
+                                }
+
                         if x2 > x1 and y2 > y1:
-                            return True, (x1, y1, x2 - x1, y2 - y1)
+                            return True, (x1, y1, x2 - x1, y2 - y1), lm
             except Exception:
                 pass
 
@@ -154,11 +184,11 @@ class FaceDetectorWrapper:
                         fw = int(fw / scale)
                         fh = int(fh / scale)
                     if fw >= w * 0.08 and fh >= h * 0.08:
-                        return True, (int(x), int(y), int(fw), int(fh))
+                        return True, (int(x), int(y), int(fw), int(fh)), None
             except Exception:
                 pass
 
-        return False, None
+        return False, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -191,31 +221,59 @@ def decode_uploaded_image_bgr(file_bytes: bytes) -> np.ndarray | None:
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def mask_out_background_keep_color(
-    img_bgr: np.ndarray, bg_gray: int = 128, enable_mask: bool = True
+def mask_face_contour_keep_color(
+    roi_bgr: np.ndarray,
+    roi_landmarks: dict | None = None,
+    bg_gray: int = 128,
+    enable_mask: bool = True,
 ) -> np.ndarray:
     """
-    顔領域の輪郭に合わせて楕円マスクを少し引き締め、左右・上部の背景混入を抑える。
-    CLAHEは使わず、元の色味を保持する。
+    切り出しROI内のランドマーク（目・口）から顔輪郭に近い楕円マスクを作成し、
+    外周の背景・髪・首端を単色グレーでマスクアウトする（CLAHEなし・色味保持）。
     """
     if not enable_mask:
-        return img_bgr
+        return roi_bgr
 
-    h, w = img_bgr.shape[:2]
+    h, w = roi_bgr.shape[:2]
     if h < 8 or w < 8:
-        return img_bgr
+        return roi_bgr
+
+    if roi_landmarks is not None:
+        re_x, re_y = roi_landmarks["right_eye"]
+        le_x, le_y = roi_landmarks["left_eye"]
+        rm_x, rm_y = roi_landmarks["right_mouth"]
+        lm_x, lm_y = roi_landmarks["left_mouth"]
+
+        eye_cx = 0.5 * (re_x + le_x)
+        eye_cy = 0.5 * (re_y + le_y)
+        mouth_cx = 0.5 * (rm_x + lm_x)
+        mouth_cy = 0.5 * (rm_y + lm_y)
+
+        eye_dist = max(12.0, float(np.hypot(le_x - re_x, le_y - re_y)))
+        eye_to_mouth = max(14.0, float(np.hypot(mouth_cx - eye_cx, mouth_cy - eye_cy)))
+
+        # 顔中心は目と口の間よりわずかに上（眉間〜鼻梁付近）
+        center_x = int(np.clip(0.5 * (eye_cx + mouth_cx), w * 0.25, w * 0.75))
+        center_y = int(np.clip(eye_cy + eye_to_mouth * 0.42, h * 0.25, h * 0.75))
+
+        # 横幅は目間距離ベースで頬の輪郭にフィット、縦幅は目〜口距離ベースで額〜顎先にフィット
+        axis_x = int(np.clip(eye_dist * 1.18, w * 0.24, w * 0.44))
+        axis_y = int(np.clip(eye_to_mouth * 1.55, h * 0.28, h * 0.48))
+    else:
+        center_x = w // 2
+        center_y = int(h * 0.48)
+        axis_x = max(4, int(w * 0.34))
+        axis_y = max(4, int(h * 0.40))
 
     mask = np.zeros((h, w), dtype=np.float32)
-    center = (w // 2, int(h * 0.47))
-    axes = (max(4, int(w * 0.34)), max(4, int(h * 0.43)))
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+    cv2.ellipse(mask, (center_x, center_y), (axis_x, axis_y), 0, 0, 360, 1.0, -1)
 
-    blur_k = max(5, (min(w, h) // 28) | 1)
+    blur_k = max(5, (min(w, h) // 32) | 1)
     mask = cv2.GaussianBlur(mask, (blur_k, blur_k), 0)
     mask_3ch = mask[:, :, np.newaxis]
 
-    bg = np.full_like(img_bgr, bg_gray, dtype=np.uint8)
-    out = img_bgr.astype(np.float32) * mask_3ch + bg.astype(np.float32) * (1.0 - mask_3ch)
+    bg = np.full_like(roi_bgr, bg_gray, dtype=np.uint8)
+    out = roi_bgr.astype(np.float32) * mask_3ch + bg.astype(np.float32) * (1.0 - mask_3ch)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -226,33 +284,42 @@ def preprocess_face_only_keep_color(
     allow_fallback: bool = False,
 ) -> tuple[bool, np.ndarray, str]:
     h, w = img_bgr.shape[:2]
-    found, bbox = detector.detect_largest_face(img_bgr)
+    found, bbox, landmarks = detector.detect_largest_face(img_bgr)
     if found and bbox is not None:
         x, y, fw, fh = bbox
         cx = x + fw / 2.0
-        cy = y + fh * 0.54
+        cy = y + fh * 0.52
 
-        box_w = int(fw * 1.28)
-        box_h = int(fh * 1.78)
+        # 顔輪郭に近づけるため枠をややコンパクトに設定
+        box_w = int(fw * 1.18)
+        box_h = int(fh * 1.42)
 
-        x1 = max(0, int(cx - box_w / 2.0))
-        y1 = max(0, int(cy - box_h / 2.0))
-        x2 = min(w, x1 + box_w)
-        y2 = min(h, y1 + box_h)
+        x1 = max(0, int(round(cx - box_w / 2.0)))
+        y1 = max(0, int(round(cy - box_h / 2.0)))
+        x2 = min(w, int(round(cx + box_w / 2.0)))
+        y2 = min(h, int(round(cy + box_h / 2.0)))
 
         cropped = img_bgr[y1:y2, x1:x2]
         if cropped.size > 0:
-            masked_bgr = mask_out_background_keep_color(
-                cropped, bg_gray=128, enable_mask=enable_mask
+            roi_landmarks = None
+            if landmarks is not None:
+                roi_landmarks = {
+                    k: (pt[0] - x1, pt[1] - y1) for k, pt in landmarks.items()
+                }
+            masked_bgr = mask_face_contour_keep_color(
+                cropped,
+                roi_landmarks=roi_landmarks,
+                bg_gray=128,
+                enable_mask=enable_mask,
             )
             return True, masked_bgr, detector.mode_label
 
     if not allow_fallback:
         return False, img_bgr, "Face_Not_Detected"
 
-    cx, cy = w / 2.0, h * 0.47
-    box_h = int(h * 0.74)
-    box_w = int(min(w * 0.76, box_h * 0.75))
+    cx, cy = w / 2.0, h * 0.48
+    box_h = int(h * 0.68)
+    box_w = int(min(w * 0.72, box_h * 0.78))
     x1 = max(0, int(cx - box_w / 2.0))
     y1 = max(0, int(cy - box_h / 2.0))
     x2 = min(w, x1 + box_w)
@@ -260,7 +327,9 @@ def preprocess_face_only_keep_color(
     cropped = img_bgr[y1:y2, x1:x2]
     if cropped.size == 0:
         cropped = img_bgr
-    masked_bgr = mask_out_background_keep_color(cropped, bg_gray=128, enable_mask=enable_mask)
+    masked_bgr = mask_face_contour_keep_color(
+        cropped, roi_landmarks=None, bg_gray=128, enable_mask=enable_mask
+    )
     return True, masked_bgr, "Fallback_Rect"
 
 
@@ -353,7 +422,7 @@ def stabilize_history(
 # ---------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="IDDM 血糖値3クラス分類", layout="wide")
-    st.title("IDDM 血糖値3クラス分類（背景完全マスク・顔未検出スキップ版）")
+    st.title("IDDM 血糖値3クラス分類（顔輪郭フィット・背景マスク改善版）")
 
     detector = get_detector()
     model, device_str, err_msg = load_trained_model(str(MODEL_PATH))
@@ -363,7 +432,7 @@ def main():
         yunet_status = "ONNXあり" if detector.yunet is not None else "ONNXなし(Haar)"
         st.caption(f"検出器: `{detector.mode_label}` ({yunet_status}) / Device: `{device_str}`")
 
-        enable_mask = st.checkbox("外周背景をマスクアウト（色味保持）", value=True)
+        enable_mask = st.checkbox("顔輪郭に合わせて外周をマスク（色味保持）", value=True)
         allow_fallback = st.checkbox("顔未検出時も中央枠で判定する（Fallback）", value=False)
         show_roi_preview = st.checkbox("前処理後の切り出し画像を表示", value=True)
 
