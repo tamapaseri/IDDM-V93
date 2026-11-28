@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-IDDM 血糖値3クラス分類 Streamlit アプリ（近接顔検出強化・背景完全マスク・Boost補正版）
+IDDM 血糖値3クラス分類 Streamlit アプリ（ROI枠引き締め・背景マスク密着・Boost補正版）
 """
 
 import io
@@ -114,7 +114,7 @@ class FaceDetectorWrapper:
             except Exception:
                 pass
 
-        # 2. Haar Cascade フォールバック（超近接アップにも対応するよう2段階で探索）
+        # 2. Haar Cascade フォールバック
         if self.haar is not None:
             try:
                 max_side = 640
@@ -132,14 +132,12 @@ class FaceDetectorWrapper:
                 dh, dw = det_bgr.shape[:2]
                 gray = cv2.cvtColor(det_bgr, cv2.COLOR_BGR2GRAY)
 
-                # 第1パス: 標準感度
                 faces = self.haar.detectMultiScale(
                     gray,
                     scaleFactor=1.08,
                     minNeighbors=3,
                     minSize=(max(16, int(dw * 0.08)), max(16, int(dh * 0.08))),
                 )
-                # 第2パス: 近接アップ・陰影差がある場合の緩和探索
                 if len(faces) == 0:
                     faces = self.haar.detectMultiScale(
                         gray,
@@ -196,6 +194,10 @@ def decode_uploaded_image_bgr(file_bytes: bytes) -> np.ndarray | None:
 def mask_out_background_keep_color(
     img_bgr: np.ndarray, bg_gray: int = 128, enable_mask: bool = True
 ) -> np.ndarray:
+    """
+    顔領域の輪郭に合わせて楕円マスクを少し引き締め、左右・上部の背景混入を抑える。
+    CLAHEは使わず、元の色味を保持する。
+    """
     if not enable_mask:
         return img_bgr
 
@@ -204,11 +206,11 @@ def mask_out_background_keep_color(
         return img_bgr
 
     mask = np.zeros((h, w), dtype=np.float32)
-    center = (w // 2, int(h * 0.46))
-    axes = (max(4, int(w * 0.44)), max(4, int(h * 0.48)))
+    center = (w // 2, int(h * 0.47))
+    axes = (max(4, int(w * 0.34)), max(4, int(h * 0.43)))
     cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
 
-    blur_k = max(5, (min(w, h) // 24) | 1)
+    blur_k = max(5, (min(w, h) // 28) | 1)
     mask = cv2.GaussianBlur(mask, (blur_k, blur_k), 0)
     mask_3ch = mask[:, :, np.newaxis]
 
@@ -228,10 +230,10 @@ def preprocess_face_only_keep_color(
     if found and bbox is not None:
         x, y, fw, fh = bbox
         cx = x + fw / 2.0
-        cy = y + fh * 0.56
+        cy = y + fh * 0.54
 
-        box_w = int(fw * 1.45)
-        box_h = int(fh * 1.95)
+        box_w = int(fw * 1.28)
+        box_h = int(fh * 1.78)
 
         x1 = max(0, int(cx - box_w / 2.0))
         y1 = max(0, int(cy - box_h / 2.0))
@@ -248,10 +250,9 @@ def preprocess_face_only_keep_color(
     if not allow_fallback:
         return False, img_bgr, "Face_Not_Detected"
 
-    # 近接アップ顔画像に合う中央縦長枠フォールバック
-    cx, cy = w / 2.0, h * 0.48
-    box_h = int(h * 0.80)
-    box_w = int(min(w * 0.84, box_h * 0.78))
+    cx, cy = w / 2.0, h * 0.47
+    box_h = int(h * 0.74)
+    box_w = int(min(w * 0.76, box_h * 0.75))
     x1 = max(0, int(cx - box_w / 2.0))
     y1 = max(0, int(cy - box_h / 2.0))
     x2 = min(w, x1 + box_w)
